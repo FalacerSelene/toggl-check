@@ -1,0 +1,235 @@
+#! /usr/bin/env racket
+;;;==========================================================================|
+;;; toggl-check : Check if your toggl timers have any overlap.               |
+;;; Copyright (C) 2018 FalacerSelene                                         |
+;;;                                                                          |
+;;; This program is free software: you can redistribute it and/or modify     |
+;;; it under the terms of the GNU General Public License as published by     |
+;;; the Free Software Foundation, either version 3 of the License, or        |
+;;; (at your option) any later version.                                      |
+;;;                                                                          |
+;;; This program is distributed in the hope that it will be useful,          |
+;;; but WITHOUT ANY WARRANTY; without even the implied warranty of           |
+;;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the            |
+;;; GNU General Public License for more details.                             |
+;;;                                                                          |
+;;; You should have received a copy of the GNU General Public License        |
+;;; along with this program.  If not, see <http://www.gnu.org/licenses/>.    |
+;;;==========================================================================|
+#lang racket/base
+
+(require racket/date
+         racket/string
+         racket/port
+         racket/cmdline
+         net/http-client
+         net/url
+         net/base64
+         json)
+
+(module+ test
+  (require rackunit))
+
+(define password (make-parameter #f))
+(define allowed-window (make-parameter 60))
+
+;;===========================================================================|
+
+(define (toggl-headers)
+  (define auth-b64 (base64-encode
+                     (string->bytes/utf-8 (format "~a:api_token" (password)))
+                     #""))
+  (list "X-Clacks-Overhead: GNU Terry Pratchett"
+        (format "Authorization: Basic ~a" auth-b64)))
+
+(module+ test
+  (let ([headers (parameterize ([password "a"])
+                   (toggl-headers))])
+    (check-equal? headers (list "X-Clacks-Overhead: GNU Terry Pratchett"
+                                "Authorization: Basic YTphcGlfdG9rZW4="))))
+
+;;===========================================================================|
+
+(define (toggl-url paths queries)
+  (url "https"
+       #f
+       "www.toggl.com"
+       #f
+       #t
+       (map (λ (p) (path/param p '())) paths)
+       queries
+       #f))
+
+(module+ test
+  (define (make-str-url p q) (url->string (toggl-url p q)))
+  (check-equal? (make-str-url '() '()) "https://www.toggl.com")
+  (check-equal? (make-str-url '("hello") '()) "https://www.toggl.com/hello")
+  (check-equal? (make-str-url '("this" "is" "a" "test") '())
+                "https://www.toggl.com/this/is/a/test")
+  (check-equal? (make-str-url '("query") '((a . "yes") (b . "no")))
+                "https://www.toggl.com/query?a=yes&b=no"))
+
+;;===========================================================================|
+
+(define (parse-time time-str)
+  (define mat (regexp-match #px"^\\s*(\\d*)(.*)$" time-str))
+  (unless mat (error 'parse-time "Unable to match time regexp"))
+  (define cnt-mat (cadr mat))
+  (define len-mat (caddr mat))
+  (define cnt (if (zero? (string-length cnt-mat))
+                  1
+                  (string->number cnt-mat)))
+  (define len
+    (let* ([trimmed (string-trim len-mat)]
+           [items (string-split trimmed)]
+           [fst (if (null? items) "s" (car items))]
+           [down (string-downcase fst)]
+           [symb (string->symbol down)])
+      (case symb
+        [(s sec secs second seconds) 1]
+        [(m min mins minute minutes) 60]
+        [(h hour hours) (* 60 60)]
+        [(d day days) (* 60 60 24)]
+        [(w week weeks) (* 60 60 24 7)]
+        [(mon month months) (* 60 60 24 31)]
+        [(y year years) (* 60 60 24 365)]
+        [else
+          (error 'parse-time "Can't understand time ~a" down)])))
+  (* cnt len))
+
+(module+ test
+  (check-equal? (parse-time "111") 111)
+  (check-equal? (parse-time "1 minute") 60)
+  (check-equal? (parse-time "222 seconds") 222)
+  (check-equal? (parse-time "7d") (* 60 60 24 7))
+  (check-equal? (parse-time "7days") (parse-time "1week")))
+
+;;===========================================================================|
+
+(define (make-time-since-seconds seconds-ago)
+  (if (not seconds-ago)
+      #f
+      (let* ([seconds (- (current-seconds) seconds-ago)]
+             [then-date (seconds->date seconds)])
+        (parameterize ([date-display-format 'iso-8601])
+          (string-append (date->string then-date #t) "Z")))))
+
+;;===========================================================================|
+
+(define (list-entries seconds)
+  (define start-str (make-time-since-seconds seconds))
+  (define this-url
+    (toggl-url
+      '("api" "v8" "time_entries")
+      (if start-str
+          (list (cons 'start_date start-str))
+          '())))
+  (define auth-b64 (base64-encode
+                     (string->bytes/utf-8 (format "~a:api_token" (password)))))
+  (define-values (rsp head body-port)
+    (http-sendrecv/url this-url #:headers (toggl-headers)))
+  (if (regexp-match? "200" rsp)
+      (read-json body-port)
+      (error 'list-entries "HTTP Error: ~a" (read-line body-port))))
+
+;;===========================================================================|
+
+(define (validate-entry-list entry-list
+                             #:not-before [not-before #f])
+  (unless (null? entry-list)
+    (define fst (car entry-list))
+    (define start-time (hash-ref fst 'start))
+    (define stop-time (hash-ref fst 'stop #f))
+    (when (and not-before
+               (string<? start-time not-before)
+               (let ([diff (get-time-diff start-time not-before)])
+                 (< diff (allowed-window))))
+      (printf "Start time (~a) is before stop time (~a).~%"
+        start-time
+        not-before))
+    (validate-entry-list
+      (cdr entry-list)
+      #:not-before (or stop-time not-before))))
+
+(module+ test
+  (define (validate-success? entry-list)
+    (let ([output (with-output-to-string
+                    (λ () (validate-entry-list entry-list)))])
+      (= (string-length output) 0)))
+  (check-true (validate-success? '()))
+  (check-true (validate-success? (list (hash 'start "2018-06-13T12:12:12Z"
+                                             'stop "2018-06-13T12:12:20Z"))))
+  (check-true (validate-success? (list (hash 'start "2018-06-13T12:12:12Z"
+                                             'stop "2018-06-13T12:12:20Z")
+                                       (hash 'start "2018-06-13T12:12:20Z"
+                                             'stop "2018-06-13T12:12:30Z"))))
+  (check-false (validate-success? (list (hash 'start "2018-06-13T12:12:12Z"
+                                              'stop "2018-06-13T12:12:21Z")
+                                        (hash 'start "2018-06-13T12:12:20Z"
+                                              'stop "2018-06-13T12:12:30Z"))))
+  )
+
+;;===========================================================================|
+
+(define (get-time-diff time-one time-two)
+  (define pat (pregexp "T(\\d{2}):(\\d{2}):(\\d{2})[\\+Z]"))
+  (define one-match (regexp-match pat time-one))
+  (define one-secs (+ (* 60 60 (string->number (cadr one-match)))
+                      (* 60 (string->number (caddr one-match)))
+                      (string->number (cadddr one-match))))
+  (define two-match (regexp-match pat time-two))
+  (define two-secs (+ (* 60 60 (string->number (cadr two-match)))
+                      (* 60 (string->number (caddr two-match)))
+                      (string->number (cadddr two-match))))
+  (- two-secs one-secs))
+
+(module+ test
+  (check-equal? (get-time-diff "2018-06-13T12:12:12Z"
+                               "2018-06-13T12:12:12+00:00")
+                0)
+  (check-equal? (get-time-diff "2018-06-13T12:12:12Z"
+                               "2018-06-13T12:12:14+00:00")
+                2)
+  (check-equal? (get-time-diff "2018-06-13T12:12:12Z"
+                               "2018-06-13T12:13:14+00:00")
+                62)
+  (check-equal? (get-time-diff "2018-06-13T12:12:12Z"
+                               "2018-06-13T14:13:14+00:00")
+                7262)
+  (check-equal? (get-time-diff "2018-06-13T14:13:14Z"
+                               "2018-06-13T12:12:12+00:00")
+                -7262))
+
+;;===========================================================================|
+
+(define (check-for-invalids seconds)
+  (define entries (list-entries seconds))
+  (define sorted (sort entries
+                       (λ (a b)
+                         (string<? (hash-ref a 'start)
+                                   (hash-ref b 'start)))))
+  (validate-entry-list sorted)
+  (define len (length sorted))
+  (printf "~a entries checked.~%" len)
+  (when (>= len 1000)
+    (printf "WARNING: 1000 is the maximum length offered over the API.")))
+
+;;===========================================================================|
+
+(module+ main
+  (define user-token (make-parameter #f))
+  (define seconds-ago (make-parameter #f))
+  (command-line
+    #:program "toggl-overlap-finder"
+    #:once-each
+    [("-t" "--token") password "Set the password"
+     (user-token password)]
+    [("-s" "--since") since "Set the time range to check (default 9 days)"
+     (seconds-ago (parse-time since))]
+    [("-a" "--allowed") all "Set the allowable overlap between tasks"
+     (allowed-window (parse-time all))]
+    #:args _
+    (unless (user-token)
+      (error 'main "No password given!"))
+    (parameterize ([password (user-token)])
+      (check-for-invalids (seconds-ago)))))
